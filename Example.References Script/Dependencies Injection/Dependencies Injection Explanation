@@ -1,0 +1,39 @@
+What is Dependency Injection (DI)?
+Dependency Injection means giving (or injecting) the things a class needs instead of having the class create them itself.
+
+Think of it like this:
+Instead of a chef (your class) going out to buy ingredients (dependencies), you have someone else bring them to the kitchen already prepared.
+
+Why Use DI in Unity?
+Unity is component-based, and you often have scripts that depend on other scripts or systems (like GameManager, AudioManager, Inventory, etc.).
+Using DI frameworks (like Zenject, Extenject, or Unity’s built-in Service Locator) helps manage those dependencies automatically.
+
+Benefits of DI in Unity
+Cleaner Code — Your classes don’t need to find objects with FindObjectOfType or GetComponent.
+
+Better Performance — Avoids repeated FindObjectOfType, GetComponent, or Resources.Load calls.
+These Unity calls are expensive, especially in Update() or during scene loads.
+DI ensures dependencies are set once at startup.
+
+Easier Testing — You can inject mock objects for testing.
+
+More Flexible Architecture — You can easily replace systems (e.g., AudioManager → AdvancedAudioManager) without touching other scripts.
+
+When to Use DI in Unity
+Use DI when:
+- Your project starts getting complex (many managers, services, or systems).
+- You find yourself doing lots of FindObjectOfType, GetComponent, or Singleton  patterns.
+- You want to test or reuse code outside of Unity’s scene system.
+
+In Short
+What:
+Give a class its dependencies instead of making it create them
+
+Why:
+Cleaner, faster, testable, flexible code
+
+When:
+As your Unity project grows and you have many interconnected systems
+
+Performance Help:
+Avoids expensive Unity calls (FindObjectOfType, GetComponent) and repeated lookupss
