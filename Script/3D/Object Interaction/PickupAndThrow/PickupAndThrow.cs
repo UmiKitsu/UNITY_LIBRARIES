@@ -1,30 +1,44 @@
 using System.Collections.Generic;
 using UnityEngine;
 
-public class PickupAndThrow : MonoBehaviour
+public class ItemInteractionController : MonoBehaviour
 {
     [Header("Setup")]
     [SerializeField] private Camera cam;
-    [SerializeField] private Transform holdPoint;
     [SerializeField] private float pickupRange = 3f;
     [SerializeField] private LayerMask pickupMask;
 
     [Header("Feel")]
-    [SerializeField] private float holdSlerp = 20f;             
+    [SerializeField] private float holdSlerp = 20f;
     [SerializeField] private float throwForwardBoost = 2f;
     [SerializeField] private float angularThrowMultiplier = 1.5f;
     [SerializeField] private int velocitySampleCount = 8;
 
+    [Header("Hold")]
+    [SerializeField] private float holdDistance = 2f;
+
     [Header("Attach (pull-in)")]
-    [SerializeField] private float attachDuration = 0.18f;      
+    [SerializeField] private float attachDuration = 0.18f;
     [SerializeField]
-    private AnimationCurve attachCurve =        
+    private AnimationCurve attachCurve =
         AnimationCurve.EaseInOut(0, 0, 1, 1);
+
+    [Header("Ground Clamp")]
+    [SerializeField] private LayerMask groundMask = ~0;
+    [SerializeField] private float groundClearance = 0.02f;
+
+    [Header("Feet Clamp")]
+    [SerializeField] private bool clampAbovePlayerFeet = true;
+    [SerializeField] private float feetClearance = 0.05f;
+
+    [Header("Throw Obstruction")]
+    [SerializeField] private float throwObstructionDistance = 1.0f;
+    [SerializeField] private LayerMask throwObstructionMask = ~0;
 
     private Rigidbody heldRb;
     private Transform heldOriginalParent;
     private Queue<Vector3> linearVelSamples = new();
-    private Vector3 lastHoldPos;
+    private Vector3 lastHeldPos;
     private Quaternion lastCamRot;
     private Vector3 camAngularVelocity;
 
@@ -33,21 +47,16 @@ public class PickupAndThrow : MonoBehaviour
     private Vector3 attachStartPos;
     private Quaternion attachStartRot;
 
-    const string HOLD_POINT_NAME = "HoldPoint";
+    private CharacterController characterController;
 
     void Awake()
     {
         if (!cam) cam = Camera.main;
-        if (!holdPoint)
-        {
-            GameObject hp = new(HOLD_POINT_NAME);
-            holdPoint = hp.transform;
-            holdPoint.SetParent(cam.transform);
-            holdPoint.SetLocalPositionAndRotation(new Vector3(0f, -0.1f, 1f), Quaternion.identity);
-        }
 
-        lastHoldPos = holdPoint.position;
+        characterController = GetComponentInParent<CharacterController>();
+
         lastCamRot = cam.transform.rotation;
+        lastHeldPos = Vector3.zero;
     }
 
     void Update()
@@ -60,30 +69,34 @@ public class PickupAndThrow : MonoBehaviour
 
         if (heldRb)
         {
+            Vector3 desiredPos = GetDesiredHoldPosition();
+            desiredPos = ConstrainToAboveGroundAndFeet(desiredPos);
+
             if (isAttaching)
             {
                 attachT += Time.deltaTime / Mathf.Max(attachDuration, 0.0001f);
                 float t = Mathf.Clamp01(attachT);
                 float k = attachCurve != null ? attachCurve.Evaluate(t) : t;
 
-                Vector3 targetPos = Vector3.Lerp(attachStartPos, holdPoint.position, k);
-                Quaternion targetRot = Quaternion.Slerp(attachStartRot, holdPoint.rotation, k);
+                Vector3 targetPos = Vector3.Lerp(attachStartPos, desiredPos, k);
+                targetPos = ConstrainToAboveGroundAndFeet(targetPos);
 
-                heldRb.MovePosition(targetPos);
+                MoveHeldRigidbody(targetPos);
+
+                Quaternion targetRot = Quaternion.Slerp(attachStartRot, cam.transform.rotation, k);
                 heldRb.MoveRotation(targetRot);
 
                 if (t >= 1f)
-                {
-                    isAttaching = false; 
-                }
+                    isAttaching = false;
             }
             else
             {
-                heldRb.MovePosition(Vector3.Lerp(heldRb.position, holdPoint.position, Time.deltaTime * holdSlerp));
-                heldRb.MoveRotation(Quaternion.Slerp(heldRb.rotation, holdPoint.rotation, Time.deltaTime * holdSlerp));
+                MoveHeldRigidbody(desiredPos);
+                heldRb.MoveRotation(Quaternion.Slerp(heldRb.rotation, cam.transform.rotation, Time.deltaTime * holdSlerp));
             }
         }
 
+        // -- camera angular velocity --
         Quaternion currentRot = cam.transform.rotation;
         Quaternion delta = currentRot * Quaternion.Inverse(lastCamRot);
         delta.ToAngleAxis(out float angleDeg, out Vector3 axis);
@@ -97,11 +110,13 @@ public class PickupAndThrow : MonoBehaviour
 
     void LateUpdate()
     {
-        Vector3 currentPos = holdPoint.position;
-        float dt = Mathf.Max(Time.deltaTime, 0.0001f);
+        if (!heldRb) return;
 
-        Vector3 vel = (currentPos - lastHoldPos) / dt;
-        lastHoldPos = currentPos;
+        float dt = Mathf.Max(Time.deltaTime, 0.0001f);
+        Vector3 currentPos = heldRb.position;
+
+        Vector3 vel = (currentPos - lastHeldPos) / dt;
+        lastHeldPos = currentPos;
 
         linearVelSamples.Enqueue(vel);
         while (linearVelSamples.Count > velocitySampleCount)
@@ -131,7 +146,7 @@ public class PickupAndThrow : MonoBehaviour
                 attachStartRot = heldRb.rotation;
 
                 linearVelSamples.Clear();
-                lastHoldPos = holdPoint.position;
+                lastHeldPos = heldRb.position;
                 lastCamRot = cam.transform.rotation;
             }
         }
@@ -146,18 +161,210 @@ public class PickupAndThrow : MonoBehaviour
         foreach (var v in linearVelSamples) avgLinear += v;
         if (count > 0) avgLinear /= count;
 
-        Vector3 forwardBoost = cam.transform.forward * throwForwardBoost;
-        Vector3 angular = camAngularVelocity * angularThrowMultiplier;
+        bool obstructed = IsThrowObstructed();
+
+        float lookDownDot = Vector3.Dot(cam.transform.forward, Vector3.down);
+        if (lookDownDot > 0.35f)
+            obstructed = true;
+
+        Vector3 forwardBoost = Vector3.zero;
+        Vector3 angular = Vector3.zero;
+
+        if (!obstructed)
+        {
+            Vector3 dir = cam.transform.forward;
+            dir.y = Mathf.Max(0f, dir.y);
+            if (dir.sqrMagnitude < 0.0001f)
+                dir = cam.transform.forward;
+
+            dir.Normalize();
+            forwardBoost = dir * throwForwardBoost;
+
+            angular = camAngularVelocity * angularThrowMultiplier;
+        }
 
         heldRb.useGravity = true;
 
-        heldRb.position = holdPoint.position + cam.transform.forward * 0.05f;
+        if (characterController != null)
+        {
+            Vector3 playerCenter = characterController.transform.TransformPoint(characterController.center);
+            Vector3 dir = (heldRb.position - playerCenter);
+            if (dir.sqrMagnitude < 0.001f)
+                dir = cam.transform.forward;
+            dir.Normalize();
+            heldRb.position += dir * 0.05f;
+        }
 
-        heldRb.linearVelocity = avgLinear + forwardBoost;
-        heldRb.angularVelocity = angular;
+        if (obstructed)
+        {
+            heldRb.linearVelocity = Vector3.zero;
+            heldRb.angularVelocity = Vector3.zero;
+        }
+        else
+        {
+            heldRb.linearVelocity = avgLinear + forwardBoost;
+            heldRb.angularVelocity = angular;
+        }
 
         heldRb = null;
         isAttaching = false;
         linearVelSamples.Clear();
+    }
+
+    Vector3 GetDesiredHoldPosition()
+    {
+        Vector3 origin = cam.transform.position;
+        Vector3 dir = cam.transform.forward;
+
+        float desiredDist = holdDistance;
+
+        int mask = throwObstructionMask;
+
+        if (Physics.Raycast(origin, dir, out RaycastHit hit, desiredDist, mask, QueryTriggerInteraction.Ignore))
+        {
+            if (!IsHeldCollider(hit.collider))
+            {
+                const float backOff = 0.1f;
+                return hit.point - dir * backOff;
+            }
+        }
+
+        return origin + dir * desiredDist;
+    }
+
+    void MoveHeldRigidbody(Vector3 targetPos)
+    {
+        if (!heldRb) return;
+
+        Vector3 toTarget = targetPos - heldRb.position;
+        Vector3 desiredVel = toTarget * holdSlerp;
+
+        heldRb.linearVelocity = desiredVel;
+    }
+
+    Vector3 ConstrainToAboveGroundAndFeet(Vector3 desiredPosition)
+    {
+        if (!heldRb) return desiredPosition;
+
+        float halfHeight = 0.5f;
+        float radius = 0.25f;
+        Collider col;
+        if (heldRb.TryGetComponent(out col))
+        {
+            Bounds b = col.bounds;
+            halfHeight = b.extents.y;
+            radius = Mathf.Max(b.extents.x, b.extents.z);
+        }
+
+        float minAllowedY = float.NegativeInfinity;
+
+        // --- Ground clamp ---
+        int mask = groundMask;
+
+        const float rayUpOffset = 0.5f;
+        float upAmount = halfHeight + rayUpOffset;
+        Vector3 rayOrigin = desiredPosition + Vector3.up * upAmount;
+        float maxDistance = upAmount + 1f;
+
+        RaycastHit[] hits = Physics.RaycastAll(rayOrigin, Vector3.down, maxDistance, mask, QueryTriggerInteraction.Ignore);
+        float closestDist = float.PositiveInfinity;
+        foreach (var h in hits)
+        {
+            if (IsHeldCollider(h.collider))
+                continue;
+
+            if (h.distance < closestDist)
+            {
+                closestDist = h.distance;
+                minAllowedY = h.point.y + halfHeight + groundClearance;
+            }
+        }
+
+        // --- Feet clamp ---
+        if (characterController != null)
+        {
+            float feetY = characterController.transform.position.y
+                          + characterController.center.y
+                          - characterController.height * 0.5f;
+
+            Vector3 feetPos = characterController.transform.position +
+                              characterController.center -
+                              Vector3.up * (characterController.height * 0.5f - characterController.radius);
+
+            float feetMinY = feetY + halfHeight + feetClearance;
+            if (float.IsNegativeInfinity(minAllowedY) || feetMinY > minAllowedY)
+                minAllowedY = feetMinY;
+
+            Vector3 horiz = desiredPosition - feetPos;
+            horiz.y = 0f;
+            float horizMag = horiz.magnitude;
+            float minHorizDist = characterController.radius + radius + 0.02f;
+
+            if (horizMag < minHorizDist)
+            {
+                Vector3 pushDir;
+                if (horizMag > 0.0001f)
+                    pushDir = horiz / horizMag;
+                else
+                    pushDir = new Vector3(cam.transform.forward.x, 0f, cam.transform.forward.z).normalized;
+
+                Vector3 newHoriz = pushDir * minHorizDist;
+                desiredPosition = new Vector3(feetPos.x + newHoriz.x, desiredPosition.y, feetPos.z + newHoriz.z);
+            }
+        }
+
+        if (!float.IsNegativeInfinity(minAllowedY) && desiredPosition.y < minAllowedY)
+            desiredPosition.y = Mathf.Lerp(desiredPosition.y, minAllowedY, 0.5f);
+
+        return desiredPosition;
+    }
+
+    bool IsThrowObstructed()
+    {
+        if (!heldRb) return false;
+
+        int mask = throwObstructionMask;
+
+        Ray ray = cam.ViewportPointToRay(new Vector3(0.5f, 0.5f, 0f));
+        if (Physics.Raycast(ray, out RaycastHit hit, throwObstructionDistance, mask, QueryTriggerInteraction.Ignore))
+        {
+            if (!IsHeldCollider(hit.collider))
+                return true;
+        }
+
+        float halfHeight = 0.5f;
+        Collider col;
+        if (heldRb.TryGetComponent(out col))
+            halfHeight = col.bounds.extents.y;
+
+        Vector3 center = heldRb.worldCenterOfMass;
+
+        float groundCheckDist = halfHeight + 0.05f;
+        if (Physics.Raycast(center + Vector3.up * 0.01f, Vector3.down, out hit, groundCheckDist, mask, QueryTriggerInteraction.Ignore))
+        {
+            if (!IsHeldCollider(hit.collider))
+                return true;
+        }
+
+        float proximityRadius = halfHeight + 0.05f;
+        Collider[] hits2 = Physics.OverlapSphere(center, proximityRadius, mask, QueryTriggerInteraction.Ignore);
+        foreach (var c in hits2)
+        {
+            if (!IsHeldCollider(c))
+                return true;
+        }
+
+        return false;
+    }
+
+    bool IsHeldCollider(Collider c)
+    {
+        if (c == null) return false;
+        if (heldRb == null) return false;
+
+        if (c.attachedRigidbody == heldRb) return true;
+        if (c.transform.IsChildOf(heldRb.transform)) return true;
+
+        return false;
     }
 }
